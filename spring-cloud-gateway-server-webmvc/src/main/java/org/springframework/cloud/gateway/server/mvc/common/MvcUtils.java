@@ -79,6 +79,11 @@ public abstract class MvcUtils {
 	public static final String CLIENT_RESPONSE_ATTR = qualify("cachedClientResponse");
 
 	/**
+	 * Client response cleanup state used while a circuit breaker may abandon a late response.
+	 */
+	public static final String CLIENT_RESPONSE_CLEANUP_ATTR = qualify("clientResponseCleanup");
+
+	/**
 	 * CircuitBreaker execution exception attribute name.
 	 */
 	public static final String CIRCUITBREAKER_EXECUTION_EXCEPTION_ATTR = qualify("circuitBreakerExecutionException");

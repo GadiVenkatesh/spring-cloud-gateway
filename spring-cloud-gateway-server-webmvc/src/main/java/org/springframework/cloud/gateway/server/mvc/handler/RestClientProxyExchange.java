@@ -22,7 +22,10 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.util.Objects;
 
+import org.jspecify.annotations.Nullable;
+
 import org.springframework.cloud.gateway.server.mvc.common.AbstractProxyExchange;
+import org.springframework.cloud.gateway.server.mvc.common.ClientResponseCleanup;
 import org.springframework.cloud.gateway.server.mvc.common.MvcUtils;
 import org.springframework.cloud.gateway.server.mvc.config.GatewayMvcProperties;
 import org.springframework.http.client.ClientHttpResponse;
@@ -48,7 +51,10 @@ public class RestClientProxyExchange extends AbstractProxyExchange {
 		if (isBodyPresent(request)) {
 			requestSpec.body(outputStream -> copyBody(request, outputStream));
 		}
-		return requestSpec.exchange((clientRequest, clientResponse) -> doExchange(request, clientResponse), false);
+		Object cleanupAttribute = request.getServerRequest().attributes().get(MvcUtils.CLIENT_RESPONSE_CLEANUP_ATTR);
+		ClientResponseCleanup responseCleanup = cleanupAttribute instanceof ClientResponseCleanup cleanup ? cleanup : null;
+		return requestSpec.exchange((clientRequest, clientResponse) -> doExchange(request, clientResponse, responseCleanup),
+				false);
 	}
 
 	private static boolean isBodyPresent(Request request) {
@@ -64,37 +70,76 @@ public class RestClientProxyExchange extends AbstractProxyExchange {
 		return StreamUtils.copy(request.getServerRequest().servletRequest().getInputStream(), outputStream);
 	}
 
-	private ServerResponse doExchange(Request request, ClientHttpResponse clientResponse) throws IOException {
-		InputStream body = clientResponse.getBody();
-		// put the body input stream in a request attribute so filters can read it.
-		MvcUtils.putAttribute(request.getServerRequest(), MvcUtils.CLIENT_RESPONSE_INPUT_STREAM_ATTR, body);
-		MvcUtils.putAttribute(request.getServerRequest(), MvcUtils.CLIENT_RESPONSE_ATTR, clientResponse);
-		ServerResponse serverResponse = GatewayServerResponse.status(clientResponse.getStatusCode())
-			.build((req, httpServletResponse) -> {
-				// get input stream from request attribute in case it was
-				// modified.
-				InputStream inputStream = MvcUtils.getAttribute(request.getServerRequest(),
-						MvcUtils.CLIENT_RESPONSE_INPUT_STREAM_ATTR);
-				Objects.requireNonNull(inputStream, "input stream cannot be null");
-				IOException copyException = null;
-				try {
-					// copy body from request to clientHttpRequest
-					RestClientProxyExchange.this.copyResponseBody(clientResponse, inputStream,
-							httpServletResponse.getOutputStream());
+	private ServerResponse doExchange(Request request, ClientHttpResponse clientResponse,
+			@Nullable ClientResponseCleanup responseCleanup) throws IOException {
+		@Nullable InputStream body = null;
+		try {
+			InputStream responseBody = clientResponse.getBody();
+			body = responseBody;
+			IOException abandonedException = new IOException("Upstream response was abandoned");
+			Runnable closeAction = () -> RestClientProxyExchange.this.closeResponse(clientResponse, responseBody,
+					abandonedException);
+			if (responseCleanup != null && !responseCleanup.register(clientResponse, closeAction)) {
+				// The circuit breaker has already returned a fallback. This late response
+				// will never be written downstream, so release it immediately.
+				return ServerResponse.ok().build();
+			}
+			// put the body input stream in a request attribute so filters can read it.
+			MvcUtils.putAttribute(request.getServerRequest(), MvcUtils.CLIENT_RESPONSE_INPUT_STREAM_ATTR, responseBody);
+			MvcUtils.putAttribute(request.getServerRequest(), MvcUtils.CLIENT_RESPONSE_ATTR, clientResponse);
+			ServerResponse serverResponse = GatewayServerResponse.status(clientResponse.getStatusCode())
+				.build((req, httpServletResponse) -> {
+					// get input stream from request attribute in case it was
+					// modified.
+					InputStream inputStream = MvcUtils.getAttribute(request.getServerRequest(),
+							MvcUtils.CLIENT_RESPONSE_INPUT_STREAM_ATTR);
+					Objects.requireNonNull(inputStream, "input stream cannot be null");
+					IOException copyException = null;
+					try {
+						// copy body from request to clientHttpRequest
+						RestClientProxyExchange.this.copyResponseBody(clientResponse, inputStream,
+								httpServletResponse.getOutputStream());
+					}
+					catch (IOException ex) {
+						copyException = ex;
+						throw ex;
+					}
+					finally {
+						try {
+							RestClientProxyExchange.this.closeResponse(clientResponse, inputStream, copyException);
+						}
+						finally {
+							if (responseCleanup != null) {
+								responseCleanup.responseClosed(clientResponse);
+							}
+						}
+					}
+					return null;
+				});
+			ClientHttpResponseAdapter proxyExchangeResponse = new ClientHttpResponseAdapter(clientResponse);
+			request.getResponseConsumers()
+				.forEach(responseConsumer -> responseConsumer.accept(proxyExchangeResponse, serverResponse));
+			return serverResponse;
+		}
+		catch (IOException | RuntimeException ex) {
+			try {
+				if (responseCleanup != null) {
+					responseCleanup.abandon();
 				}
-				catch (IOException ex) {
-					copyException = ex;
-					throw ex;
+				if (body == null) {
+					clientResponse.close();
 				}
-				finally {
-					RestClientProxyExchange.this.closeResponse(clientResponse, inputStream, copyException);
+				else if (responseCleanup == null) {
+					IOException closeReason = ex instanceof IOException ioException ? ioException
+							: new IOException("Failed to prepare upstream response", ex);
+					RestClientProxyExchange.this.closeResponse(clientResponse, body, closeReason);
 				}
-				return null;
-			});
-		ClientHttpResponseAdapter proxyExchangeResponse = new ClientHttpResponseAdapter(clientResponse);
-		request.getResponseConsumers()
-			.forEach(responseConsumer -> responseConsumer.accept(proxyExchangeResponse, serverResponse));
-		return serverResponse;
+			}
+			catch (RuntimeException closeException) {
+				ex.addSuppressed(closeException);
+			}
+			throw ex;
+		}
 	}
 
 }
