@@ -33,6 +33,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.springframework.cloud.client.circuitbreaker.CircuitBreaker;
 import org.springframework.cloud.client.circuitbreaker.CircuitBreakerFactory;
+import org.springframework.cloud.gateway.server.mvc.common.ClientResponseCleanup;
 import org.springframework.cloud.gateway.server.mvc.common.Configurable;
 import org.springframework.cloud.gateway.server.mvc.common.HttpStatusHolder;
 import org.springframework.cloud.gateway.server.mvc.common.MvcUtils;
@@ -79,6 +80,8 @@ public abstract class CircuitBreakerFilterFunctions {
 			.map(status -> HttpStatusHolder.valueOf(status).resolve())
 			.collect(Collectors.toSet());
 		return (request, next) -> {
+			ClientResponseCleanup responseCleanup = new ClientResponseCleanup();
+			request.attributes().put(MvcUtils.CLIENT_RESPONSE_CLEANUP_ATTR, responseCleanup);
 			CircuitBreakerFactory<?, ?> circuitBreakerFactory = MvcUtils.getApplicationContext(request)
 				.getBean(CircuitBreakerFactory.class);
 			// TODO: cache
@@ -99,6 +102,8 @@ public abstract class CircuitBreakerFilterFunctions {
 					throw new RuntimeException(e);
 				}
 			}, throwable -> {
+				// The response may have arrived while the timeout/fallback won the race.
+				responseCleanup.abandon();
 				// if no fallback
 				if (!StringUtils.hasText(config.getFallbackPath())) {
 					// if timeout exception, GATEWAY_TIMEOUT

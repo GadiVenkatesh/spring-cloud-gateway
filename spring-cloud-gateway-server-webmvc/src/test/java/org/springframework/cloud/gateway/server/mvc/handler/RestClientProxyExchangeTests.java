@@ -26,6 +26,8 @@ import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.WriteListener;
 import org.junit.jupiter.api.Test;
 
+import org.springframework.cloud.gateway.server.mvc.common.ClientResponseCleanup;
+import org.springframework.cloud.gateway.server.mvc.common.MvcUtils;
 import org.springframework.cloud.gateway.server.mvc.config.GatewayMvcProperties;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
@@ -55,6 +57,38 @@ import static org.mockito.Mockito.when;
  * @author Goutam Adwant
  */
 class RestClientProxyExchangeTests {
+
+	@Test
+	void exchangeWhenCircuitBreakerHasAlreadyReturnedFallbackThenClosesLateResponse() {
+		RestClient restClient = mock(RestClient.class);
+		RestClient.RequestBodyUriSpec requestSpec = mock(RestClient.RequestBodyUriSpec.class);
+		CloseAwareInputStream responseBody = new CloseAwareInputStream();
+		TestClientHttpResponse clientResponse = new TestClientHttpResponse(responseBody);
+
+		when(restClient.method(HttpMethod.GET)).thenReturn(requestSpec);
+		when(requestSpec.uri(any(URI.class))).thenReturn(requestSpec);
+		when(requestSpec.headers(any())).thenReturn(requestSpec);
+		when(requestSpec.exchange(any(), eq(false))).thenAnswer((invocation) -> {
+			RestClient.RequestHeadersSpec.ExchangeFunction<ServerResponse> exchangeFunction = invocation.getArgument(0);
+			return exchangeFunction.exchange(mock(HttpRequest.class), clientResponse);
+		});
+
+		RestClientProxyExchange proxyExchange = new RestClientProxyExchange(restClient, new GatewayMvcProperties());
+		MockHttpServletRequest servletRequest = MockMvcRequestBuilders.get("http://localhost/test")
+			.buildRequest(null);
+		ServerRequest serverRequest = ServerRequest.create(servletRequest, Collections.emptyList());
+		ClientResponseCleanup responseCleanup = new ClientResponseCleanup();
+		responseCleanup.abandon();
+		clientResponse.headers.setContentType(MediaType.APPLICATION_JSON);
+		serverRequest.attributes().put(MvcUtils.CLIENT_RESPONSE_CLEANUP_ATTR, responseCleanup);
+		ProxyExchange.Request request = proxyExchange.request(serverRequest)
+			.uri(URI.create("http://localhost:8781/upstream"))
+			.build();
+
+		proxyExchange.exchange(request);
+
+		assertThat(clientResponse.closed).isTrue();
+	}
 
 	@Test
 	void exchangeWhenStreamingResponseCopyFailsThenDoesNotCloseClientResponse() {
